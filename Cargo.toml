@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-redis = "0.23"
+redis = { version = "0.32.2", features = ["tokio-comp", "aio", "connection-manager"] }
 tokio = { version = "1", features = ["full"] }

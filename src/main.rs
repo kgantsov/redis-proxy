@@ -3,9 +3,10 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
-use redis::{Client, Connection, RedisResult};
+use redis::{Client, RedisResult};
+use redis::aio::ConnectionManager;
 use anyhow::{Result, Context, anyhow};
 
 #[derive(Debug, Clone)]
@@ -78,9 +79,8 @@ impl ConsistentHash {
     }
 }
 
-#[derive(Debug)]
 pub struct ConnectionPool {
-    connections: HashMap<String, Client>,
+    connections: HashMap<String, Arc<tokio::sync::Mutex<ConnectionManager>>>,
 }
 
 impl ConnectionPool {
@@ -90,15 +90,17 @@ impl ConnectionPool {
         }
     }
 
-    pub fn add_connection(&mut self, node: &RedisNode) -> Result<()> {
+    pub async fn add_connection(&mut self, node: &RedisNode) -> Result<()> {
         let client = Client::open(node.connection_string())
             .context("Failed to create Redis client")?;
-        self.connections.insert(node.id.clone(), client);
+        let conn = ConnectionManager::new(client).await
+            .context("Failed to get async Redis connection manager")?;
+        self.connections.insert(node.id.clone(), Arc::new(tokio::sync::Mutex::new(conn)));
         Ok(())
     }
 
-    pub fn get_connection(&self, node_id: &str) -> Option<&Client> {
-        self.connections.get(node_id)
+    pub fn get_connection(&self, node_id: &str) -> Option<Arc<tokio::sync::Mutex<ConnectionManager>>> {
+        self.connections.get(node_id).cloned()
     }
 }
 
@@ -189,7 +191,6 @@ impl SimpleRespParser {
     }
 }
 
-#[derive(Debug)]
 pub struct RedisProxy {
     consistent_hash: Arc<RwLock<ConsistentHash>>,
     connection_pool: Arc<RwLock<ConnectionPool>>,
@@ -207,7 +208,7 @@ impl RedisProxy {
         // Add to connection pool
         {
             let mut pool = self.connection_pool.write().await;
-            pool.add_connection(&node)?;
+            pool.add_connection(&node).await?;
         }
 
         // Add to consistent hash
@@ -306,24 +307,17 @@ impl RedisProxy {
         };
 
         // Get connection for the node
-        let client = {
+        let conn_manager = {
             let pool = self.connection_pool.read().await;
             match pool.get_connection(&node.id) {
-                Some(client) => client.clone(),
+                Some(conn) => conn,
                 None => return Ok("-ERR node connection not available\r\n".to_string()),
             }
         };
 
-        // Execute command on the target Redis node
-        match self.execute_redis_command(&client, parts).await {
-            Ok(response) => {
-                // release the connection back to the pool
-                // {
-                //     let mut pool = self.connection_pool.write().await;
-                //     pool.connections.insert(node.id.clone(), client);
-                // }
-                Ok(response)
-            },
+        let mut conn = conn_manager.lock().await;
+        match self.execute_redis_command(&mut conn, parts).await {
+            Ok(response) => Ok(response),
             Err(e) => {
                 eprintln!("Error executing command on node {}: {}", node.id, e);
                 Ok(format!("-ERR {}\r\n", e))
@@ -331,10 +325,8 @@ impl RedisProxy {
         }
     }
 
-    async fn execute_redis_command(&self, client: &Client, parts: &[String]) -> Result<String> {
-        let mut conn = client.get_connection()
-            .context("Failed to get Redis connection")?;
-
+    async fn execute_redis_command(&self, conn: &mut ConnectionManager, parts: &[String]) -> Result<String> {
+        use redis::AsyncCommands;
         let cmd = parts[0].to_uppercase();
 
         match cmd.as_str() {
@@ -342,8 +334,10 @@ impl RedisProxy {
                 if parts.len() != 2 {
                     return Ok("-ERR wrong number of arguments for 'get' command\r\n".to_string());
                 }
+                // let value: &str = "1";
+                // Ok(format!("${}\r\n{}\r\n", value.len(), value))
                 let key = &parts[1];
-                let result: RedisResult<Option<String>> = redis::cmd("GET").arg(key).query(&mut conn);
+                let result: RedisResult<Option<String>> = conn.get(key).await;
                 match result {
                     Ok(Some(value)) => Ok(format!("${}\r\n{}\r\n", value.len(), value)),
                     Ok(None) => Ok("$-1\r\n".to_string()),
@@ -354,18 +348,10 @@ impl RedisProxy {
                 if parts.len() < 3 {
                     return Ok("-ERR wrong number of arguments for 'set' command\r\n".to_string());
                 }
+                // Ok("+OK\r\n".to_string())
                 let key = &parts[1];
                 let value = &parts[2];
-                
-                let mut cmd = redis::cmd("SET");
-                cmd.arg(key).arg(value);
-                
-                // Add any additional arguments (like EX, PX, NX, XX)
-                for arg in &parts[3..] {
-                    cmd.arg(arg);
-                }
-                
-                let result: RedisResult<String> = cmd.query(&mut conn);
+                let result: RedisResult<String> = conn.set(key, value).await;
                 match result {
                     Ok(_) => Ok("+OK\r\n".to_string()),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -375,11 +361,8 @@ impl RedisProxy {
                 if parts.len() < 2 {
                     return Ok("-ERR wrong number of arguments for 'del' command\r\n".to_string());
                 }
-                let mut cmd = redis::cmd("DEL");
-                for key in &parts[1..] {
-                    cmd.arg(key);
-                }
-                let result: RedisResult<i32> = cmd.query(&mut conn);
+                let keys = &parts[1..];
+                let result: RedisResult<i32> = conn.del(keys).await;
                 match result {
                     Ok(count) => Ok(format!(":{}\r\n", count)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -389,11 +372,8 @@ impl RedisProxy {
                 if parts.len() < 2 {
                     return Ok("-ERR wrong number of arguments for 'exists' command\r\n".to_string());
                 }
-                let mut cmd = redis::cmd("EXISTS");
-                for key in &parts[1..] {
-                    cmd.arg(key);
-                }
-                let result: RedisResult<i32> = cmd.query(&mut conn);
+                let keys = &parts[1..];
+                let result: RedisResult<i32> = conn.exists(keys).await;
                 match result {
                     Ok(count) => Ok(format!(":{}\r\n", count)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -404,7 +384,7 @@ impl RedisProxy {
                     return Ok("-ERR wrong number of arguments for 'incr' command\r\n".to_string());
                 }
                 let key = &parts[1];
-                let result: RedisResult<i64> = redis::cmd("INCR").arg(key).query(&mut conn);
+                let result: RedisResult<i64> = conn.incr(key, 1).await;
                 match result {
                     Ok(value) => Ok(format!(":{}\r\n", value)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -415,7 +395,7 @@ impl RedisProxy {
                     return Ok("-ERR wrong number of arguments for 'decr' command\r\n".to_string());
                 }
                 let key = &parts[1];
-                let result: RedisResult<i64> = redis::cmd("DECR").arg(key).query(&mut conn);
+                let result: RedisResult<i64> = conn.decr(key, 1).await;
                 match result {
                     Ok(value) => Ok(format!(":{}\r\n", value)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -426,7 +406,7 @@ impl RedisProxy {
                     return Ok("-ERR wrong number of arguments for 'ttl' command\r\n".to_string());
                 }
                 let key = &parts[1];
-                let result: RedisResult<i64> = redis::cmd("TTL").arg(key).query(&mut conn);
+                let result: RedisResult<i64> = conn.ttl(key).await;
                 match result {
                     Ok(ttl) => Ok(format!(":{}\r\n", ttl)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -437,8 +417,8 @@ impl RedisProxy {
                     return Ok("-ERR wrong number of arguments for 'expire' command\r\n".to_string());
                 }
                 let key = &parts[1];
-                let seconds = &parts[2];
-                let result: RedisResult<i32> = redis::cmd("EXPIRE").arg(key).arg(seconds).query(&mut conn);
+                let seconds: i64 = parts[2].parse().unwrap_or(0);
+                let result: RedisResult<i32> = conn.expire(key, seconds).await;
                 match result {
                     Ok(result) => Ok(format!(":{}\r\n", result)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -450,7 +430,7 @@ impl RedisProxy {
                 }
                 let key = &parts[1];
                 let field = &parts[2];
-                let result: RedisResult<Option<String>> = redis::cmd("HGET").arg(key).arg(field).query(&mut conn);
+                let result: RedisResult<Option<String>> = conn.hget(key, field).await;
                 match result {
                     Ok(Some(value)) => Ok(format!("${}\r\n{}\r\n", value.len(), value)),
                     Ok(None) => Ok("$-1\r\n".to_string()),
@@ -464,7 +444,7 @@ impl RedisProxy {
                 let key = &parts[1];
                 let field = &parts[2];
                 let value = &parts[3];
-                let result: RedisResult<i32> = redis::cmd("HSET").arg(key).arg(field).arg(value).query(&mut conn);
+                let result: RedisResult<i32> = conn.hset(key, field, value).await;
                 match result {
                     Ok(result) => Ok(format!(":{}\r\n", result)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
