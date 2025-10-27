@@ -68,7 +68,7 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/redis-proxy:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/redis-proxy:${{ github.ref_name }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
 
   release:
     name: Create GitHub Release
