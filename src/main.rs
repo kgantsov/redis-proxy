@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use clap::Parser;
 use redis::aio::ConnectionManager;
 use redis::{Client, RedisResult};
 use std::collections::hash_map::DefaultHasher;
@@ -490,15 +491,41 @@ impl Clone for RedisProxy {
     }
 }
 
+/// Redis proxy CLI that accepts multiple node IDs and hosts
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    /// List of node IDs (e.g. --node-ids node1 node2 node3)
+    #[arg(long, num_args = 1.., value_name = "NODE_ID")]
+    node_ids: Vec<String>,
+
+    /// List of hosts (e.g. --hosts 127.0.0.1:6379 127.0.0.1:6380)
+    #[arg(long, num_args = 1.., value_name = "HOST")]
+    hosts: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let proxy = RedisProxy::new(150, 50);
+    let args = Args::parse();
 
-    let nodes = vec![
-        RedisNode::new("node1".to_string(), "127.0.0.1".to_string(), 6379),
-        RedisNode::new("node2".to_string(), "127.0.0.1".to_string(), 6380),
-        RedisNode::new("node3".to_string(), "127.0.0.1".to_string(), 6381),
-    ];
+    if args.node_ids.len() != args.hosts.len() {
+        eprintln!("Error: node_ids and hosts must have the same length");
+        std::process::exit(1);
+    }
+
+    let mut nodes: Vec<RedisNode> = Vec::new();
+
+    for (id, host) in args.node_ids.iter().zip(args.hosts.iter()) {
+        // parse host and port from host string
+        let parts: Vec<&str> = host.split(':').collect();
+        let host = parts[0].to_string();
+        let port = parts[1].parse::<u16>().unwrap_or(6379);
+
+        println!("Node {id} -> {host}:{port}");
+        nodes.push(RedisNode::new(id.clone(), host, port));
+    }
+
+    let proxy = RedisProxy::new(150, 50);
 
     for node in nodes {
         if let Err(e) = proxy.add_node(node.clone()).await {
