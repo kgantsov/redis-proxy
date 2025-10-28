@@ -8,3 +8,6 @@ anyhow = "1"
 redis = { version = "0.32.2", features = ["tokio-comp", "aio", "connection-manager"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
+prometheus = "0.13"
+lazy_static = "1.4"
+actix-web = "4"

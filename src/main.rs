@@ -1,5 +1,12 @@
+use actix_web::{get, App, HttpResponse, HttpServer, Responder};
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use lazy_static::lazy_static;
+use prometheus::{self, gather, Encoder, TextEncoder};
+use prometheus::{
+    default_registry, register_histogram, register_int_counter, register_int_gauge, Histogram,
+    IntCounter, IntGauge,
+};
 use redis::aio::ConnectionManager;
 use redis::{Client, RedisResult};
 use std::collections::hash_map::DefaultHasher;
@@ -8,7 +15,27 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::signal;
 use tokio::sync::RwLock;
+
+lazy_static! {
+    pub static ref COMMANDS_PROXIED_COUNTER: IntCounter = register_int_counter!(
+        "redis_proxy_commands_proxied_total",
+        "Number of commands proxied"
+    )
+    .unwrap();
+    pub static ref CONNECTIONS_GAUGE: IntGauge =
+        register_int_gauge!("redis_proxy_connections", "Current number of connections").unwrap();
+    pub static ref PROXY_LATENCY_HISTOGRAM: Histogram = register_histogram!(
+        "redis_proxy_proxy_latency_seconds",
+        "Histogram of proxy latencies in seconds",
+        vec![
+            0.000001, 0.000002, 0.000005, 0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.005,
+            0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+        ]
+    )
+    .unwrap();
+}
 
 #[derive(Debug, Clone)]
 pub struct RedisNode {
@@ -251,6 +278,7 @@ impl RedisProxy {
         loop {
             let (socket, addr) = listener.accept().await?;
             println!("New connection from {}", addr);
+            CONNECTIONS_GAUGE.inc();
 
             let proxy = self.clone();
             tokio::spawn(async move {
@@ -273,13 +301,17 @@ impl RedisProxy {
 
             let data = String::from_utf8_lossy(&buffer[..n]);
 
+            let timer = PROXY_LATENCY_HISTOGRAM.start_timer();
             if let Some(command) = parser.parse_command(&data)? {
                 let response = self.process_command(&command).await?;
                 socket.write_all(response.as_bytes()).await?;
             }
+            timer.observe_duration();
+            COMMANDS_PROXIED_COUNTER.inc();
         }
 
         println!("Client disconnected");
+        CONNECTIONS_GAUGE.dec();
         Ok(())
     }
 
@@ -508,6 +540,17 @@ struct Args {
     address: String,
 }
 
+#[get("/metrics")]
+async fn metrics() -> impl Responder {
+    let encoder = TextEncoder::new();
+    let metric_families = gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    HttpResponse::Ok()
+        .content_type(encoder.format_type())
+        .body(buffer)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -520,7 +563,6 @@ async fn main() -> Result<()> {
     let mut nodes: Vec<RedisNode> = Vec::new();
 
     for (id, host) in args.node_ids.iter().zip(args.hosts.iter()) {
-        // parse host and port from host string
         let parts: Vec<&str> = host.split(':').collect();
         let host = parts[0].to_string();
         let port = parts[1].parse::<u16>().unwrap_or(6379);
@@ -542,7 +584,30 @@ async fn main() -> Result<()> {
         }
     }
 
-    proxy.start_server(&args.address).await?;
+    // Start metrics server in background
+    let metrics_server = HttpServer::new(|| App::new().service(metrics))
+        .bind("127.0.0.1:9090")?
+        .run();
+
+    // Start Redis proxy server in background
+    let proxy_server = proxy.start_server(&args.address);
+
+    // Graceful shutdown on Ctrl+C
+    tokio::select! {
+        res = metrics_server => {
+            if let Err(e) = res {
+                eprintln!("Metrics server error: {}", e);
+            }
+        }
+        res = proxy_server => {
+            if let Err(e) = res {
+                eprintln!("Proxy server error: {}", e);
+            }
+        }
+        _ = signal::ctrl_c() => {
+            println!("Received Ctrl+C, shutting down...");
+        }
+    }
 
     Ok(())
 }
