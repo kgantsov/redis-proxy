@@ -502,6 +502,10 @@ struct Args {
     /// List of hosts (e.g. --hosts 127.0.0.1:6379 127.0.0.1:6380)
     #[arg(long, num_args = 1.., value_name = "HOST")]
     hosts: Vec<String>,
+
+    // Address to listen on (e.g. --address 0.0.0.0:6379)
+    #[arg(long, value_name = "ADDRESS", default_value = "0.0.0.0:6379")]
+    address: String,
 }
 
 #[tokio::main]
@@ -538,7 +542,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    proxy.start_server("127.0.0.1:46379").await?;
+    proxy.start_server(&args.address).await?;
 
     Ok(())
 }
