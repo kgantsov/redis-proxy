@@ -11,3 +11,4 @@ clap = { version = "4", features = ["derive"] }
 prometheus = "0.13"
 lazy_static = "1.4"
 actix-web = "4"
+sysinfo = "0.32"

@@ -4,8 +4,7 @@ use clap::Parser;
 use lazy_static::lazy_static;
 use prometheus::{self, gather, Encoder, TextEncoder};
 use prometheus::{
-    default_registry, register_histogram, register_int_counter, register_int_gauge, Histogram,
-    IntCounter, IntGauge,
+    register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
 };
 use redis::aio::ConnectionManager;
 use redis::{Client, RedisResult};
@@ -13,6 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use sysinfo::System;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
@@ -35,6 +35,30 @@ lazy_static! {
         ]
     )
     .unwrap();
+    static ref CPU_USAGE_GAUGE: IntGauge =
+        register_int_gauge!("process_cpu_usage_percent", "Current process CPU usage (%)").unwrap();
+    static ref MEMORY_USAGE_GAUGE: IntGauge = register_int_gauge!(
+        "process_memory_usage_bytes",
+        "Current process memory usage in bytes"
+    )
+    .unwrap();
+    static ref SYSTEM_MEMORY_GAUGE: IntGauge =
+        register_int_gauge!("system_memory_used_bytes", "System memory used in bytes").unwrap();
+    static ref SYSTEM_CPU_GAUGE: IntGauge =
+        register_int_gauge!("system_cpu_usage_percent", "System-wide CPU usage (%)").unwrap();
+}
+
+pub fn update_process_metrics() {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    if let Some(proc) = sys.process(sysinfo::get_current_pid().unwrap()) {
+        CPU_USAGE_GAUGE.set(proc.cpu_usage() as i64);
+        MEMORY_USAGE_GAUGE.set(proc.memory() as i64);
+    }
+
+    SYSTEM_MEMORY_GAUGE.set(sys.used_memory() as i64);
+    SYSTEM_CPU_GAUGE.set(sys.global_cpu_usage() as i64);
 }
 
 #[derive(Debug, Clone)]
@@ -298,10 +322,10 @@ impl RedisProxy {
             if n == 0 {
                 break;
             }
+            let timer = PROXY_LATENCY_HISTOGRAM.start_timer();
 
             let data = String::from_utf8_lossy(&buffer[..n]);
 
-            let timer = PROXY_LATENCY_HISTOGRAM.start_timer();
             if let Some(command) = parser.parse_command(&data)? {
                 let response = self.process_command(&command).await?;
                 socket.write_all(response.as_bytes()).await?;
@@ -559,6 +583,14 @@ async fn main() -> Result<()> {
         eprintln!("Error: node_ids and hosts must have the same length");
         std::process::exit(1);
     }
+
+    // Spawn a background task to refresh system stats
+    tokio::spawn(async {
+        loop {
+            update_process_metrics();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 
     let mut nodes: Vec<RedisNode> = Vec::new();
 
