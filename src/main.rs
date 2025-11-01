@@ -182,7 +182,7 @@ impl ConnectionPool {
     }
 }
 
-// Simple RESP parser (unchanged)
+// Simple RESP parser (FIXED for pipelining)
 #[derive(Debug)]
 pub struct SimpleRespParser {
     buffer: String,
@@ -195,68 +195,125 @@ impl SimpleRespParser {
         }
     }
 
-    pub fn parse_command(&mut self, data: &str) -> Result<Option<Vec<String>>> {
+    /// Appends new data from the socket to our internal buffer
+    pub fn append_data(&mut self, data: &str) {
         self.buffer.push_str(data);
-
-        if let Some(result) = self.try_parse_array()? {
-            return Ok(Some(result));
-        }
-
-        Ok(None)
     }
 
+    /// Tries to parse one complete command from the buffer.
+    /// If successful, it consumes the command from the buffer and returns it.
+    pub fn try_parse_command(&mut self) -> Result<Option<Vec<String>>> {
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
+
+        if self.buffer.starts_with('*') {
+            // It's a RESP Array
+            self.try_parse_array()
+        } else {
+            // It's an inline command (like the old parser supported)
+            self.try_parse_inline()
+        }
+    }
+
+    /// Handles inline commands (non-array)
+    fn try_parse_inline(&mut self) -> Result<Option<Vec<String>>> {
+        if let Some(newline_pos) = self.buffer.find('\n') {
+            let line_str = &self.buffer[..newline_pos].trim_end_matches('\r');
+            let parts: Vec<String> = line_str.split_whitespace().map(|s| s.to_string()).collect();
+
+            // Drain the consumed line (including the \n)
+            self.buffer.drain(..newline_pos + 1);
+
+            if parts.is_empty() {
+                // Was just a newline, try parsing again
+                return self.try_parse_command();
+            }
+            Ok(Some(parts))
+        } else {
+            Ok(None) // No complete line
+        }
+    }
+
+    /// Handles RESP array commands
     fn try_parse_array(&mut self) -> Result<Option<Vec<String>>> {
-        let lines: Vec<&str> = self.buffer.lines().collect();
-        if lines.is_empty() {
-            return Ok(None);
+        let mut start_of_buffer = 0;
+
+        // 1. Find the first line (array length)
+        let (first_line, mut bytes_consumed_so_far) =
+            match self.buffer[start_of_buffer..].find('\n') {
+                Some(newline_pos) => {
+                    let end_of_line_content = start_of_buffer + newline_pos; // index of \n
+
+                    // --- FIX IS HERE --- (Removed the &)
+                    let line_content =
+                        self.buffer[start_of_buffer..end_of_line_content].trim_end_matches('\r');
+
+                    // Return the line content and the byte offset *after* the \n
+                    (line_content, end_of_line_content + 1)
+                }
+                None => return Ok(None), // Not even one full line
+            };
+
+        if !first_line.starts_with('*') {
+            return Err(anyhow!("Expected array start (*) but got '{}'", first_line));
         }
 
-        if lines[0].starts_with('*') {
-            let array_len: usize = lines[0][1..]
-                .parse()
-                .context("Failed to parse array length")?;
+        let array_len: usize = first_line[1..]
+            .parse()
+            .context("Failed to parse array length")?;
 
-            if array_len == 0 {
-                self.buffer.clear();
-                return Ok(Some(vec![]));
-            }
+        if array_len == 0 {
+            // Empty array. Consume the first line.
+            self.buffer.drain(..bytes_consumed_so_far);
+            return Ok(Some(vec![]));
+        }
 
-            let needed_lines = 1 + array_len * 2;
-            if lines.len() < needed_lines {
-                return Ok(None);
-            }
+        let needed_lines = 1 + array_len * 2;
+        let mut result = Vec::with_capacity(array_len);
+        let mut current_line_count = 1;
 
-            let mut result = Vec::new();
-            let mut line_idx = 1;
+        // 2. Loop to find all component lines
+        while current_line_count < needed_lines {
+            // Set the start of our search to be *after* the previous line
+            start_of_buffer = bytes_consumed_so_far;
 
-            for _ in 0..array_len {
-                if line_idx >= lines.len() {
-                    return Ok(None);
-                }
+            match self.buffer[start_of_buffer..].find('\n') {
+                Some(newline_pos) => {
+                    let end_of_line_content = start_of_buffer + newline_pos;
 
-                if lines[line_idx].starts_with('$') {
-                    line_idx += 1;
-                    if line_idx < lines.len() {
-                        result.push(lines[line_idx].to_string());
-                        line_idx += 1;
+                    // Update total bytes consumed to be *after* this new line's \n
+                    bytes_consumed_so_far = end_of_line_content + 1;
+
+                    // Is this a $ line or a data line?
+                    // (current_line_count starts at 1)
+                    if current_line_count % 2 == 1 {
+                        // This should be a $ line
+                        // --- FIX IS HERE --- (Removed the &)
+                        let dollar_line = self.buffer[start_of_buffer..end_of_line_content]
+                            .trim_end_matches('\r');
+                        if !dollar_line.starts_with('$') {
+                            return Err(anyhow!("Expected bulk string ($)"));
+                        }
+                        // Production-grade parser would validate the length here
+                    } else {
+                        // This is a data line
+                        // --- FIX IS HERE --- (Removed the &)
+                        let data_line = self.buffer[start_of_buffer..end_of_line_content]
+                            .trim_end_matches('\r');
+                        result.push(data_line.to_string());
                     }
-                } else {
-                    return Err(anyhow!("Expected bulk string"));
+
+                    current_line_count += 1;
                 }
+                None => return Ok(None), // Buffer ended, command not complete
             }
-
-            self.buffer.clear();
-            return Ok(Some(result));
         }
 
-        if !self.buffer.contains('\n') {
-            return Ok(None);
-        }
-
-        let line = self.buffer.lines().next().unwrap();
-        let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
-        self.buffer.clear();
-        Ok(Some(parts))
+        // 3. If we got here, we parsed all lines.
+        //    `bytes_consumed_so_far` now holds the total byte offset.
+        self.buffer.drain(..bytes_consumed_so_far);
+        return Ok(Some(result));
     }
 
     pub fn reset(&mut self) {
@@ -315,23 +372,39 @@ impl RedisProxy {
 
     async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
         let mut parser = SimpleRespParser::new();
-        let mut buffer = [0; 4096];
+        let mut buffer = [0; 4096]; // This is the read buffer
 
         loop {
             let n = socket.read(&mut buffer).await?;
             if n == 0 {
-                break;
+                break; // Connection closed
             }
             let timer = PROXY_LATENCY_HISTOGRAM.start_timer();
 
             let data = String::from_utf8_lossy(&buffer[..n]);
 
-            if let Some(command) = parser.parse_command(&data)? {
+            // Append the newly read data to the parser's internal buffer
+            parser.append_data(&data);
+
+            let mut all_responses = String::new();
+
+            // --- Pipelining Fix ---
+            // Loop and try to parse commands as long as we can
+            while let Some(command) = parser.try_parse_command()? {
+                // We successfully parsed *one* command
                 let response = self.process_command(&command).await?;
-                socket.write_all(response.as_bytes()).await?;
+                all_responses.push_str(&response);
+                COMMANDS_PROXIED_COUNTER.inc(); // Increment per-command
             }
+            // --- End Fix ---
+
+            // Send all batched responses back at once
+            if !all_responses.is_empty() {
+                socket.write_all(all_responses.as_bytes()).await?;
+            }
+
             timer.observe_duration();
-            COMMANDS_PROXIED_COUNTER.inc();
+            // COMMANDS_PROXIED_COUNTER is now incremented inside the loop
         }
 
         println!("Client disconnected");
@@ -347,8 +420,8 @@ impl RedisProxy {
         let cmd = parts[0].to_uppercase();
 
         match cmd.as_str() {
-            "GET" | "SET" | "DEL" | "EXISTS" | "INCR" | "DECR" | "EXPIRE" | "TTL" | "HGET"
-            | "HSET" => {
+            "GET" | "SET" | "DEL" | "EXISTS" | "INCR" | "INCRBY" | "DECR" | "DECRBY" | "EXPIRE"
+            | "TTL" | "HGET" | "HSET" | "APPEND" | "KEYS" => {
                 if parts.len() < 2 {
                     return Ok("-ERR wrong number of arguments\r\n".to_string());
                 }
@@ -365,6 +438,7 @@ impl RedisProxy {
             }
             "INFO" => Ok("$17\r\nRedis Proxy v1.0\r\n".to_string()),
             "COMMAND" => Ok("*0\r\n".to_string()),
+            "CLIENT" => Ok("+OK\r\n".to_string()),
             _ => Ok(format!("-ERR unknown command '{}'\r\n", cmd)),
         }
     }
@@ -469,6 +543,26 @@ impl RedisProxy {
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
                 }
             }
+            "INCRBY" => {
+                if parts.len() != 3 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'incrby' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let value = parts[2].parse::<i64>();
+
+                match value {
+                    Ok(value) => {
+                        let result: RedisResult<i64> = conn.incr(key, value).await;
+                        match result {
+                            Ok(value) => Ok(format!(":{}\r\n", value)),
+                            Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                        }
+                    }
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
             "DECR" => {
                 if parts.len() != 2 {
                     return Ok("-ERR wrong number of arguments for 'decr' command\r\n".to_string());
@@ -478,6 +572,25 @@ impl RedisProxy {
                 match result {
                     Ok(value) => Ok(format!(":{}\r\n", value)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "DECRBY" => {
+                if parts.len() != 3 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'decrby' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let value = parts[2].parse::<i64>();
+                match value {
+                    Ok(value) => {
+                        let result: RedisResult<i64> = conn.decr(key, value).await;
+                        match result {
+                            Ok(value) => Ok(format!(":{}\r\n", value)),
+                            Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                        }
+                    }
+                    Err(_) => Ok("-ERR value is not an integer or out of range\r\n".to_string()),
                 }
             }
             "TTL" => {
@@ -526,6 +639,20 @@ impl RedisProxy {
                 let field = &parts[2];
                 let value = &parts[3];
                 let result: RedisResult<i32> = conn.hset(key, field, value).await;
+                match result {
+                    Ok(result) => Ok(format!(":{}\r\n", result)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "APPEND" => {
+                if parts.len() != 3 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'append' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let value = &parts[2];
+                let result: RedisResult<i32> = conn.append(key, value).await;
                 match result {
                     Ok(result) => Ok(format!(":{}\r\n", result)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
@@ -685,3 +812,5 @@ mod tests {
         assert_eq!(node.unwrap().id, "node2");
     }
 }
+
+// *4\r\n$6\r\nCLIENT\r\n$7\r\nSETINFO\r\n$8\r\nLIB-NAME\r\n$8\r\nredis-py\r\n*4\r\n$6\r\nCLIENT\r\n$7\r\nSETINFO\r\n$7\r\nLIB-VER\r\n$5\r\n5.0.3
