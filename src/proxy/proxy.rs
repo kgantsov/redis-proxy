@@ -1,0 +1,381 @@
+use anyhow::{Context, Result};
+use redis::aio::ConnectionManager;
+use redis::RedisResult;
+use redis_protocol::resp2::types::OwnedFrame;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
+
+use crate::metrics::prometheus::{COMMANDS_PROXIED_COUNTER, CONNECTIONS_GAUGE};
+use crate::protocol::commands::Command;
+use crate::protocol::parser::parse_command;
+use crate::protocol::parser::{encode_frame, resp_err, RespDecoder};
+use crate::proxy::connection_pool::ConnectionPool;
+use crate::proxy::consistent_hash::ConsistentHash;
+use crate::proxy::node::RedisNode;
+
+pub struct RedisProxy {
+    consistent_hash: Arc<RwLock<ConsistentHash>>,
+    connection_pool: Arc<RwLock<ConnectionPool>>,
+}
+
+impl RedisProxy {
+    pub fn new(replicas: usize, pool_size: usize) -> Self {
+        Self {
+            consistent_hash: Arc::new(RwLock::new(ConsistentHash::new(replicas))),
+            connection_pool: Arc::new(RwLock::new(ConnectionPool::new(pool_size))),
+        }
+    }
+
+    pub async fn add_node(&self, node: RedisNode) -> Result<()> {
+        let mut pool = self.connection_pool.write().await;
+        pool.add_connection(&node).await?;
+
+        let mut hash = self.consistent_hash.write().await;
+        hash.add_node(node);
+
+        Ok(())
+    }
+
+    pub async fn remove_node(&self, node_id: &str) {
+        let mut hash = self.consistent_hash.write().await;
+        hash.remove_node(node_id);
+    }
+
+    pub async fn start_server(&self, bind_addr: &str) -> Result<()> {
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .context("Failed to bind to address")?;
+
+        println!("Redis proxy listening on {}", bind_addr);
+
+        loop {
+            let (socket, addr) = listener.accept().await?;
+            println!("New connection from {}", addr);
+            CONNECTIONS_GAUGE.inc();
+
+            let proxy = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = proxy.handle_client(socket).await {
+                    eprintln!("Error handling client {}: {}", addr, e);
+                }
+            });
+        }
+    }
+
+    async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
+        let mut decoder = RespDecoder::new();
+        let mut read_buf = [0u8; 4096];
+
+        loop {
+            let n = socket.read(&mut read_buf).await?;
+            if n == 0 {
+                break;
+            }
+
+            decoder.feed(&read_buf[..n]);
+
+            while let Some(frame) = decoder.next_frame()? {
+                let cmd = match parse_command(frame) {
+                    Ok(cmd) => cmd,
+                    Err(e) => {
+                        socket.write_all(&resp_err(&e.to_string())).await?;
+                        continue;
+                    }
+                };
+
+                let response = self.execute_command(cmd).await;
+                socket.write_all(&response).await?;
+                COMMANDS_PROXIED_COUNTER.inc();
+            }
+        }
+
+        CONNECTIONS_GAUGE.dec();
+        Ok(())
+    }
+
+    async fn execute_command(&self, cmd: Command) -> Vec<u8> {
+        // Convert Command back to Vec<String>
+        let parts: Vec<String> = match cmd {
+            Command::Get(k) => vec!["GET".into(), k],
+            Command::Set(k, v) => vec!["SET".into(), k, v],
+            Command::Del(keys) => {
+                let mut v = vec!["DEL".into()];
+                v.extend(keys);
+                v
+            }
+            Command::Exists(keys) => {
+                let mut v = vec!["EXISTS".into()];
+                v.extend(keys);
+                v
+            }
+            Command::Incr(k) => vec!["INCR".into(), k],
+            Command::IncrBy(k, n) => vec!["INCRBY".into(), k, n.to_string()],
+            Command::Decr(k) => vec!["DECR".into(), k],
+            Command::DecrBy(k, n) => vec!["DECRBY".into(), k, n.to_string()],
+            Command::Expire(k, s) => vec!["EXPIRE".into(), k, s.to_string()],
+            Command::Ttl(k) => vec!["TTL".into(), k],
+            Command::HGet(k, f) => vec!["HGET".into(), k, f],
+            Command::HSet(k, f, v) => vec!["HSET".into(), k, f, v],
+            Command::Append(k, v) => vec!["APPEND".into(), k, v],
+
+            Command::Ping(msg) => {
+                return match msg {
+                    Some(s) => encode_frame(OwnedFrame::BulkString(s.into_bytes())),
+                    None => encode_frame(OwnedFrame::SimpleString(b"PONG".to_vec())),
+                };
+            }
+
+            Command::Info => {
+                return encode_frame(OwnedFrame::BulkString(b"Redis Proxy v1.0".to_vec()))
+            }
+
+            Command::Command => return encode_frame(OwnedFrame::Array(vec![])),
+
+            Command::Client => return encode_frame(OwnedFrame::SimpleString(b"OK".to_vec())),
+        };
+
+        // Commands that touch data must have a key
+        if parts.len() < 2 {
+            return resp_err("ERR wrong number of arguments");
+        }
+
+        let key = &parts[1];
+
+        match self.proxy_command_to_node(key, &parts).await {
+            Ok(resp_string) => resp_string.into_bytes(),
+            Err(e) => resp_err(&e.to_string()),
+        }
+    }
+
+    async fn proxy_command_to_node(&self, key: &str, parts: &[String]) -> Result<String> {
+        let node = {
+            let hash = self.consistent_hash.read().await;
+            match hash.get_node(key) {
+                Some(node) => node.clone(),
+                None => return Ok("-ERR no available nodes\r\n".to_string()),
+            }
+        };
+
+        let conn_manager = {
+            let pool = self.connection_pool.read().await;
+            match pool.get_connection(&node.id) {
+                Some(conn) => conn,
+                None => return Ok("-ERR node connection not available\r\n".to_string()),
+            }
+        };
+
+        let mut conn = conn_manager.lock().await;
+        match self.execute_redis_command(&mut conn, parts).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                eprintln!("Error executing command on node {}: {}", node.id, e);
+                Ok(format!("-ERR {}\r\n", e))
+            }
+        }
+    }
+
+    // Original method for pooled connections
+    async fn execute_redis_command(
+        &self,
+        conn: &mut ConnectionManager,
+        parts: &[String],
+    ) -> Result<String> {
+        // Same implementation as in your original code
+        use redis::AsyncCommands;
+        let cmd = parts[0].to_uppercase();
+
+        match cmd.as_str() {
+            "GET" => {
+                if parts.len() != 2 {
+                    return Ok("-ERR wrong number of arguments for 'get' command\r\n".to_string());
+                }
+                // let value: &str = "1";
+                // Ok(format!("${}\r\n{}\r\n", value.len(), value))
+                let key = &parts[1];
+                let result: RedisResult<Option<String>> = conn.get(key).await;
+                match result {
+                    Ok(Some(value)) => Ok(format!("${}\r\n{}\r\n", value.len(), value)),
+                    Ok(None) => Ok("$-1\r\n".to_string()),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "SET" => {
+                if parts.len() < 3 {
+                    return Ok("-ERR wrong number of arguments for 'set' command\r\n".to_string());
+                }
+                // Ok("+OK\r\n".to_string())
+                let key = &parts[1];
+                let value = &parts[2];
+                let result: RedisResult<String> = conn.set(key, value).await;
+                match result {
+                    Ok(_) => Ok("+OK\r\n".to_string()),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "DEL" => {
+                if parts.len() < 2 {
+                    return Ok("-ERR wrong number of arguments for 'del' command\r\n".to_string());
+                }
+                let keys = &parts[1..];
+                let result: RedisResult<i32> = conn.del(keys).await;
+                match result {
+                    Ok(count) => Ok(format!(":{}\r\n", count)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "EXISTS" => {
+                if parts.len() < 2 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'exists' command\r\n".to_string()
+                    );
+                }
+                let keys = &parts[1..];
+                let result: RedisResult<i32> = conn.exists(keys).await;
+                match result {
+                    Ok(count) => Ok(format!(":{}\r\n", count)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "INCR" => {
+                if parts.len() != 2 {
+                    return Ok("-ERR wrong number of arguments for 'incr' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let result: RedisResult<i64> = conn.incr(key, 1).await;
+                match result {
+                    Ok(value) => Ok(format!(":{}\r\n", value)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "INCRBY" => {
+                if parts.len() != 3 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'incrby' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let value = parts[2].parse::<i64>();
+
+                match value {
+                    Ok(value) => {
+                        let result: RedisResult<i64> = conn.incr(key, value).await;
+                        match result {
+                            Ok(value) => Ok(format!(":{}\r\n", value)),
+                            Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                        }
+                    }
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "DECR" => {
+                if parts.len() != 2 {
+                    return Ok("-ERR wrong number of arguments for 'decr' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let result: RedisResult<i64> = conn.decr(key, 1).await;
+                match result {
+                    Ok(value) => Ok(format!(":{}\r\n", value)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "DECRBY" => {
+                if parts.len() != 3 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'decrby' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let value = parts[2].parse::<i64>();
+                match value {
+                    Ok(value) => {
+                        let result: RedisResult<i64> = conn.decr(key, value).await;
+                        match result {
+                            Ok(value) => Ok(format!(":{}\r\n", value)),
+                            Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                        }
+                    }
+                    Err(_) => Ok("-ERR value is not an integer or out of range\r\n".to_string()),
+                }
+            }
+            "TTL" => {
+                if parts.len() != 2 {
+                    return Ok("-ERR wrong number of arguments for 'ttl' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let result: RedisResult<i64> = conn.ttl(key).await;
+                match result {
+                    Ok(ttl) => Ok(format!(":{}\r\n", ttl)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "EXPIRE" => {
+                if parts.len() != 3 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'expire' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let seconds: i64 = parts[2].parse().unwrap_or(0);
+                let result: RedisResult<i32> = conn.expire(key, seconds).await;
+                match result {
+                    Ok(result) => Ok(format!(":{}\r\n", result)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "HGET" => {
+                if parts.len() != 3 {
+                    return Ok("-ERR wrong number of arguments for 'hget' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let field = &parts[2];
+                let result: RedisResult<Option<String>> = conn.hget(key, field).await;
+                match result {
+                    Ok(Some(value)) => Ok(format!("${}\r\n{}\r\n", value.len(), value)),
+                    Ok(None) => Ok("$-1\r\n".to_string()),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "HSET" => {
+                if parts.len() != 4 {
+                    return Ok("-ERR wrong number of arguments for 'hset' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let field = &parts[2];
+                let value = &parts[3];
+                let result: RedisResult<i32> = conn.hset(key, field, value).await;
+                match result {
+                    Ok(result) => Ok(format!(":{}\r\n", result)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "APPEND" => {
+                if parts.len() != 3 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'append' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let value = &parts[2];
+                let result: RedisResult<i32> = conn.append(key, value).await;
+                match result {
+                    Ok(result) => Ok(format!(":{}\r\n", result)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            // Add other commands as needed...
+            _ => Ok(format!("-ERR unknown command '{}'\r\n", cmd)),
+        }
+    }
+}
+
+impl Clone for RedisProxy {
+    fn clone(&self) -> Self {
+        Self {
+            consistent_hash: Arc::clone(&self.consistent_hash),
+            connection_pool: Arc::clone(&self.connection_pool),
+            // client_pool: Arc::clone(&self.client_pool),
+        }
+    }
+}
