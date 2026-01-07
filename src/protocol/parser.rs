@@ -50,6 +50,38 @@ pub fn parse_parts(parts: &[String]) -> anyhow::Result<Command> {
         "GET" if parts.len() == 2 => Ok(Command::Get(parts[1].clone())),
         "SET" if parts.len() >= 3 => Ok(Command::Set(parts[1].clone(), parts[2].clone())),
         "DEL" if parts.len() >= 2 => Ok(Command::Del(parts[1..].to_vec())),
+        "EXISTS" if parts.len() == 2 => Ok(Command::Exists(parts[1..].to_vec())),
+        "INCR" if parts.len() == 2 => Ok(Command::Incr(parts[1].clone())),
+        "INCRBY" if parts.len() == 3 => {
+            let amount = parts[2]
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("ERR value is not an integer or out of range"))?;
+            Ok(Command::IncrBy(parts[1].clone(), amount))
+        }
+        "DECR" if parts.len() == 2 => Ok(Command::Decr(parts[1].clone())),
+        "DECRBY" if parts.len() == 3 => {
+            let amount = parts[2]
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("ERR value is not an integer or out of range"))?;
+            Ok(Command::DecrBy(parts[1].clone(), amount))
+        }
+        "TTL" if parts.len() == 2 => Ok(Command::Ttl(parts[1].clone())),
+        "EXPIRE" if parts.len() == 3 => {
+            let seconds = parts[2]
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("ERR value is not an integer or out of range"))?;
+            Ok(Command::Expire(parts[1].clone(), seconds))
+        }
+        "HGET" if parts.len() == 3 => Ok(Command::HGet(parts[1].clone(), parts[2].clone())),
+        "HSET" if parts.len() == 4 => Ok(Command::HSet(
+            parts[1].clone(),
+            parts[2].clone(),
+            parts[3].clone(),
+        )),
+        "APPEND" if parts.len() == 3 => {
+            let value = parts[2].clone();
+            Ok(Command::Append(parts[1].clone(), value))
+        }
         "PING" => Ok(Command::Ping(parts.get(1).cloned())),
         "INFO" => Ok(Command::Info),
         "COMMAND" => Ok(Command::Command),
