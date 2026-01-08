@@ -1,4 +1,8 @@
 pub enum Command {
+    Hello {
+        version: Option<i64>,
+        auth: Option<(String, String)>,
+    },
     Get(String),
     Set(String, String),
     Del(Vec<String>),

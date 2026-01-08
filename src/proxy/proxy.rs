@@ -98,6 +98,18 @@ impl RedisProxy {
     async fn execute_command(&self, cmd: Command) -> Vec<u8> {
         // Convert Command back to Vec<String>
         let parts: Vec<String> = match cmd {
+            Command::Hello { version, auth } => {
+                println!("Got hello command with {:?} {:?}", version, auth);
+                let mut v = vec!["HELLO".into()];
+                if let Some(version) = version {
+                    v.push(version.to_string());
+                }
+                if let Some((username, password)) = auth {
+                    v.push(username);
+                    v.push(password);
+                }
+                v
+            }
             Command::Get(k) => vec!["GET".into(), k],
             Command::Set(k, v) => vec!["SET".into(), k, v],
             Command::Del(keys) => {
