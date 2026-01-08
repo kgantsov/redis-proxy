@@ -66,7 +66,7 @@ impl RedisProxy {
 
     async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
         let mut decoder = RespDecoder::new();
-        let mut read_buf = [0u8; 4096];
+        let mut read_buf = vec![0u8; 8192]; // Larger initial buffer, still efficient
 
         loop {
             let n = socket.read(&mut read_buf).await?;

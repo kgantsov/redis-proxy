@@ -12,12 +12,19 @@ pub struct RespDecoder {
 impl RespDecoder {
     pub fn new() -> Self {
         Self {
-            buf: BytesMut::with_capacity(4096),
+            // Start with 8KB, will grow as needed
+            buf: BytesMut::with_capacity(8192),
         }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
+
+        const MAX_BUFFER_SIZE: usize = 512 * 1024 * 1024; // 512MB
+        if self.buf.len() > MAX_BUFFER_SIZE {
+            self.buf.clear();
+            // TODO: return an error here
+        }
     }
 
     pub fn next_frame(&mut self) -> anyhow::Result<Option<OwnedFrame>> {
@@ -113,13 +120,23 @@ pub fn parse_command(frame: OwnedFrame) -> anyhow::Result<Command> {
 }
 
 pub fn encode_frame(frame: OwnedFrame) -> Vec<u8> {
-    // Max Redis frame size is unknown; 4KB is safe for responses
-    let mut buf = vec![0u8; 4096];
+    // Start with reasonable size, will grow if needed
+    let mut buf = Vec::with_capacity(1024);
 
-    let size = encode(&mut buf, &frame, false).expect("RESP encode failed");
-
-    buf.truncate(size);
-    buf
+    // Encode with automatic buffer growing
+    loop {
+        match encode(&mut buf, &frame, false) {
+            Ok(size) => {
+                buf.truncate(size);
+                return buf;
+            }
+            Err(_) => {
+                // Buffer too small, grow and retry
+                let new_capacity = buf.capacity() * 2;
+                buf.resize(new_capacity, 0);
+            }
+        }
+    }
 }
 
 pub fn resp_ok() -> Vec<u8> {
