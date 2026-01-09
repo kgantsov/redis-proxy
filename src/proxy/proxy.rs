@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use redis::aio::ConnectionManager;
 use redis::RedisResult;
-use redis_protocol::resp2::types::OwnedFrame;
+use redis_protocol::resp2::types::OwnedFrame as Resp2OwnedFrame;
+use redis_protocol::resp3::types::OwnedFrame as Resp3OwnedFrame;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -9,8 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::metrics::prometheus::{COMMANDS_PROXIED_COUNTER, CONNECTIONS_GAUGE};
 use crate::protocol::commands::Command;
-use crate::protocol::parser::parse_command;
-use crate::protocol::parser::{encode_frame, resp_err, RespDecoder};
+use crate::protocol::parser::{parse_command, Protocol, RedisFrame, RespDecoder};
 use crate::proxy::connection_pool::ConnectionPool;
 use crate::proxy::consistent_hash::ConsistentHash;
 use crate::proxy::node::RedisNode;
@@ -67,6 +67,7 @@ impl RedisProxy {
     async fn handle_client(&self, mut socket: TcpStream) -> Result<()> {
         let mut decoder = RespDecoder::new();
         let mut read_buf = vec![0u8; 8192]; // Larger initial buffer, still efficient
+        let mut client_protocol: Option<Protocol> = None;
 
         loop {
             let n = socket.read(&mut read_buf).await?;
@@ -76,16 +77,22 @@ impl RedisProxy {
 
             decoder.feed(&read_buf[..n]);
 
-            while let Some(frame) = decoder.next_frame()? {
+            while let Some((frame, proto)) = decoder.next_frame()? {
+                // Remember which protocol this client is using
+                if client_protocol.is_none() {
+                    client_protocol = Some(proto);
+                }
+
                 let cmd = match parse_command(frame) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        socket.write_all(&resp_err(&e.to_string())).await?;
+                        let err_response = encode_error(&e.to_string(), proto);
+                        socket.write_all(&err_response).await?;
                         continue;
                     }
                 };
 
-                let response = self.execute_command(cmd).await;
+                let response = self.execute_command(cmd, proto).await;
                 socket.write_all(&response).await?;
                 COMMANDS_PROXIED_COUNTER.inc();
             }
@@ -95,7 +102,7 @@ impl RedisProxy {
         Ok(())
     }
 
-    async fn execute_command(&self, cmd: Command) -> Vec<u8> {
+    async fn execute_command(&self, cmd: Command, proto: Protocol) -> Vec<u8> {
         // Convert Command back to Vec<String>
         let parts: Vec<String> = match cmd {
             Command::Hello { version, auth } => {
@@ -134,30 +141,46 @@ impl RedisProxy {
 
             Command::Ping(msg) => {
                 return match msg {
-                    Some(s) => encode_frame(OwnedFrame::BulkString(s.into_bytes())),
-                    None => encode_frame(OwnedFrame::SimpleString(b"PONG".to_vec())),
+                    Some(s) => encode_response(
+                        &RedisFrame::Resp2(Resp2OwnedFrame::BulkString(s.into_bytes())),
+                        proto,
+                    ),
+                    None => encode_response(
+                        &RedisFrame::Resp2(Resp2OwnedFrame::SimpleString(b"PONG".to_vec())),
+                        proto,
+                    ),
                 };
             }
 
             Command::Info => {
-                return encode_frame(OwnedFrame::BulkString(b"Redis Proxy v1.0".to_vec()))
+                return encode_response(
+                    &RedisFrame::Resp2(Resp2OwnedFrame::BulkString(b"Redis Proxy v1.0".to_vec())),
+                    proto,
+                )
             }
 
-            Command::Command => return encode_frame(OwnedFrame::Array(vec![])),
+            Command::Command => {
+                return encode_response(&RedisFrame::Resp2(Resp2OwnedFrame::Array(vec![])), proto)
+            }
 
-            Command::Client => return encode_frame(OwnedFrame::SimpleString(b"OK".to_vec())),
+            Command::Client => {
+                return encode_response(
+                    &RedisFrame::Resp2(Resp2OwnedFrame::SimpleString(b"OK".to_vec())),
+                    proto,
+                )
+            }
         };
 
         // Commands that touch data must have a key
         if parts.len() < 2 {
-            return resp_err("ERR wrong number of arguments");
+            return encode_error("ERR wrong number of arguments", proto);
         }
 
         let key = &parts[1];
 
         match self.proxy_command_to_node(key, &parts).await {
             Ok(resp_string) => resp_string.into_bytes(),
-            Err(e) => resp_err(&e.to_string()),
+            Err(e) => encode_error(&e.to_string(), proto),
         }
     }
 
@@ -390,4 +413,39 @@ impl Clone for RedisProxy {
             // client_pool: Arc::clone(&self.client_pool),
         }
     }
+}
+
+/// Helper function to encode an error response using the client's protocol
+fn encode_error(msg: &str, proto: Protocol) -> Vec<u8> {
+    match proto {
+        Protocol::Resp2 => {
+            let frame = Resp2OwnedFrame::Error(msg.to_string());
+            crate::protocol::parser::encode_frame(frame)
+        }
+        Protocol::Resp3 => {
+            let frame = Resp3OwnedFrame::SimpleError {
+                data: msg.to_string(),
+                attributes: None,
+            };
+            let mut buf = Vec::with_capacity(512);
+            loop {
+                match redis_protocol::resp3::encode::complete::encode(&mut buf, &frame, false) {
+                    Ok(size) => {
+                        buf.truncate(size);
+                        return buf;
+                    }
+                    Err(_) => {
+                        let new_capacity = buf.capacity() * 2;
+                        buf.resize(new_capacity, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Helper function to encode a response frame using the client's protocol
+fn encode_response(frame: &RedisFrame, proto: Protocol) -> Vec<u8> {
+    use crate::protocol::parser::encode_frame_for_protocol;
+    encode_frame_for_protocol(frame, proto)
 }
