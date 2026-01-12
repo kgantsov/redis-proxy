@@ -17,6 +17,8 @@ pub enum Command {
     HSet(String, String, String),
     Append(String, String),
     Ping(Option<String>),
+    SAdd(String, Vec<String>),
+    SMembers(String),
     Info,
     Command,
     Client,

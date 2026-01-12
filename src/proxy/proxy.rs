@@ -138,6 +138,12 @@ impl RedisProxy {
             Command::HGet(k, f) => vec!["HGET".into(), k, f],
             Command::HSet(k, f, v) => vec!["HSET".into(), k, f, v],
             Command::Append(k, v) => vec!["APPEND".into(), k, v],
+            Command::SAdd(k, members) => {
+                let mut v = vec!["SADD".into(), k];
+                v.extend(members);
+                v
+            }
+            Command::SMembers(k) => vec!["SMEMBERS".into(), k],
 
             Command::Ping(msg) => {
                 return match msg {
@@ -399,8 +405,43 @@ impl RedisProxy {
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
                 }
             }
+            "SADD" => {
+                if parts.len() < 3 {
+                    return Ok("-ERR wrong number of arguments for 'sadd' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let members = &parts[2..];
+                let result: RedisResult<i32> = conn.sadd(key, members).await;
+                match result {
+                    Ok(result) => Ok(format!(":{}\r\n", result)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "SMEMBERS" => {
+                if parts.len() != 2 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'smembers' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let result: RedisResult<Vec<String>> = conn.smembers(key).await;
+                match result {
+                    Ok(result) => {
+                        let mut response = String::new();
+                        response.push_str(&format!("*{}\r\n", result.len()));
+                        for member in result {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        Ok(response)
+                    }
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
             // Add other commands as needed...
-            _ => Ok(format!("-ERR unknown command '{}'\r\n", cmd)),
+            _ => {
+                println!("Unknown command '{}' {:?}", cmd, parts);
+                Ok(format!("-ERR unknown command '{}'\r\n", cmd))
+            }
         }
     }
 }

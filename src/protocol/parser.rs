@@ -167,6 +167,8 @@ pub fn parse_parts(parts: &[String]) -> anyhow::Result<Command> {
             let value = parts[2].clone();
             Ok(Command::Append(parts[1].clone(), value))
         }
+        "SADD" if parts.len() >= 3 => Ok(Command::SAdd(parts[1].clone(), parts[2..].to_vec())),
+        "SMEMBERS" if parts.len() == 2 => Ok(Command::SMembers(parts[1].clone())),
         "PING" => Ok(Command::Ping(parts.get(1).cloned())),
         "INFO" => Ok(Command::Info),
         "COMMAND" => Ok(Command::Command),
