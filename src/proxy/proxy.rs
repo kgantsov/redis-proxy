@@ -103,6 +103,23 @@ impl RedisProxy {
     }
 
     async fn execute_command(&self, cmd: Command, proto: Protocol) -> Vec<u8> {
+        // Handle multi-key commands that need distribution across nodes
+        match &cmd {
+            Command::Del(keys) if !keys.is_empty() => {
+                match self.proxy_multi_key_command("DEL", keys).await {
+                    Ok(resp_string) => return resp_string.into_bytes(),
+                    Err(e) => return encode_error(&e.to_string(), proto),
+                }
+            }
+            Command::Exists(keys) if !keys.is_empty() => {
+                match self.proxy_multi_key_command("EXISTS", keys).await {
+                    Ok(resp_string) => return resp_string.into_bytes(),
+                    Err(e) => return encode_error(&e.to_string(), proto),
+                }
+            }
+            _ => {}
+        }
+
         // Convert Command back to Vec<String>
         let parts: Vec<String> = match cmd {
             Command::Hello { version, auth } => {
@@ -215,6 +232,78 @@ impl RedisProxy {
                 Ok(format!("-ERR {}\r\n", e))
             }
         }
+    }
+
+    async fn proxy_multi_key_command(&self, command: &str, keys: &[String]) -> Result<String> {
+        use std::collections::HashMap;
+
+        // Group keys by their target nodes
+        let mut keys_by_node: HashMap<String, Vec<String>> = HashMap::new();
+
+        {
+            let hash = self.consistent_hash.read().await;
+            for key in keys {
+                match hash.get_node(key) {
+                    Some(node) => {
+                        keys_by_node
+                            .entry(node.id.clone())
+                            .or_insert_with(Vec::new)
+                            .push(key.clone());
+                    }
+                    None => return Ok("-ERR no available nodes\r\n".to_string()),
+                }
+            }
+        }
+
+        // Execute command on each node and aggregate results
+        let mut total_count = 0;
+
+        for (node_id, node_keys) in keys_by_node {
+            let conn_manager = {
+                let pool = self.connection_pool.read().await;
+                match pool.get_connection(&node_id) {
+                    Some(conn) => conn,
+                    None => return Ok("-ERR node connection not available\r\n".to_string()),
+                }
+            };
+
+            let mut parts = vec![command.to_string()];
+            parts.extend(node_keys);
+
+            let mut conn = conn_manager.lock().await;
+            match self.execute_redis_command(&mut conn, &parts).await {
+                Ok(response) => {
+                    // Parse the integer response
+                    if let Some(count_str) = response.strip_prefix(':') {
+                        if let Some(count_str) = count_str.strip_suffix("\r\n") {
+                            if let Ok(count) = count_str.parse::<i32>() {
+                                total_count += count;
+                            } else {
+                                return Ok(format!(
+                                    "-ERR invalid response from node {}\r\n",
+                                    node_id
+                                ));
+                            }
+                        } else {
+                            return Ok(format!("-ERR invalid response from node {}\r\n", node_id));
+                        }
+                    } else if response.starts_with("-ERR") {
+                        return Ok(response);
+                    } else {
+                        return Ok(format!(
+                            "-ERR unexpected response from node {}\r\n",
+                            node_id
+                        ));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error executing command on node {}: {}", node_id, e);
+                    return Ok(format!("-ERR {}\r\n", e));
+                }
+            }
+        }
+
+        Ok(format!(":{}\r\n", total_count))
     }
 
     // Original method for pooled connections

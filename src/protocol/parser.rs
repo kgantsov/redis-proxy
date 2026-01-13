@@ -135,7 +135,7 @@ pub fn parse_parts(parts: &[String]) -> anyhow::Result<Command> {
         "GET" if parts.len() == 2 => Ok(Command::Get(parts[1].clone())),
         "SET" if parts.len() >= 3 => Ok(Command::Set(parts[1].clone(), parts[2].clone())),
         "DEL" if parts.len() >= 2 => Ok(Command::Del(parts[1..].to_vec())),
-        "EXISTS" if parts.len() == 2 => Ok(Command::Exists(parts[1..].to_vec())),
+        "EXISTS" if parts.len() >= 2 => Ok(Command::Exists(parts[1..].to_vec())),
         "INCR" if parts.len() == 2 => Ok(Command::Incr(parts[1].clone())),
         "INCRBY" if parts.len() == 3 => {
             let amount = parts[2]
