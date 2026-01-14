@@ -3,6 +3,7 @@ use redis::aio::ConnectionManager;
 use redis::RedisResult;
 use redis_protocol::resp2::types::OwnedFrame as Resp2OwnedFrame;
 use redis_protocol::resp3::types::OwnedFrame as Resp3OwnedFrame;
+use std::mem;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -154,9 +155,16 @@ impl RedisProxy {
             Command::Ttl(k) => vec!["TTL".into(), k],
             Command::HGet(k, f) => vec!["HGET".into(), k, f],
             Command::HSet(k, f, v) => vec!["HSET".into(), k, f, v],
+            Command::HGetAll(k) => vec!["HGETALL".into(), k],
+            Command::HVals(k) => vec!["HVALS".into(), k],
             Command::Append(k, v) => vec!["APPEND".into(), k, v],
             Command::SAdd(k, members) => {
                 let mut v = vec!["SADD".into(), k];
+                v.extend(members);
+                v
+            }
+            Command::SRem(k, members) => {
+                let mut v = vec!["SREM".into(), k];
                 v.extend(members);
                 v
             }
@@ -480,6 +488,44 @@ impl RedisProxy {
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),
                 }
             }
+            "HGETALL" => {
+                if parts.len() != 2 {
+                    return Ok(
+                        "-ERR wrong number of arguments for 'hgetall' command\r\n".to_string()
+                    );
+                }
+                let key = &parts[1];
+                let result: RedisResult<Vec<String>> = conn.hgetall(key).await;
+                match result {
+                    Ok(result) => {
+                        let mut response = String::new();
+                        response.push_str(&format!("*{}\r\n", result.len()));
+                        for member in result {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        Ok(response)
+                    }
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "HVALS" => {
+                if parts.len() != 2 {
+                    return Ok("-ERR wrong number of arguments for 'hvals' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let result: RedisResult<Vec<String>> = conn.hvals(key).await;
+                match result {
+                    Ok(result) => {
+                        let mut response = String::new();
+                        response.push_str(&format!("*{}\r\n", result.len()));
+                        for member in result {
+                            response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                        }
+                        Ok(response)
+                    }
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
             "APPEND" => {
                 if parts.len() != 3 {
                     return Ok(
@@ -501,6 +547,18 @@ impl RedisProxy {
                 let key = &parts[1];
                 let members = &parts[2..];
                 let result: RedisResult<i32> = conn.sadd(key, members).await;
+                match result {
+                    Ok(result) => Ok(format!(":{}\r\n", result)),
+                    Err(e) => Ok(format!("-ERR {}\r\n", e)),
+                }
+            }
+            "SREM" => {
+                if parts.len() < 3 {
+                    return Ok("-ERR wrong number of arguments for 'srem' command\r\n".to_string());
+                }
+                let key = &parts[1];
+                let members = &parts[2..];
+                let result: RedisResult<i32> = conn.srem(key, members).await;
                 match result {
                     Ok(result) => Ok(format!(":{}\r\n", result)),
                     Err(e) => Ok(format!("-ERR {}\r\n", e)),

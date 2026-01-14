@@ -1,3 +1,5 @@
+use clap::builder::Str;
+
 pub enum Command {
     Hello {
         version: Option<i64>,
@@ -14,10 +16,13 @@ pub enum Command {
     Expire(String, i64),
     Ttl(String),
     HGet(String, String),
+    HGetAll(String),
+    HVals(String),
     HSet(String, String, String),
     Append(String, String),
     Ping(Option<String>),
     SAdd(String, Vec<String>),
+    SRem(String, Vec<String>),
     SMembers(String),
     Info,
     Command,

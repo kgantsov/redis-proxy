@@ -163,11 +163,14 @@ pub fn parse_parts(parts: &[String]) -> anyhow::Result<Command> {
             parts[2].clone(),
             parts[3].clone(),
         )),
+        "HGETALL" if parts.len() == 2 => Ok(Command::HGetAll(parts[1].clone())),
+        "HVALS" if parts.len() == 2 => Ok(Command::HVals(parts[1].clone())),
         "APPEND" if parts.len() == 3 => {
             let value = parts[2].clone();
             Ok(Command::Append(parts[1].clone(), value))
         }
         "SADD" if parts.len() >= 3 => Ok(Command::SAdd(parts[1].clone(), parts[2..].to_vec())),
+        "SREM" if parts.len() >= 3 => Ok(Command::SRem(parts[1].clone(), parts[2..].to_vec())),
         "SMEMBERS" if parts.len() == 2 => Ok(Command::SMembers(parts[1].clone())),
         "PING" => Ok(Command::Ping(parts.get(1).cloned())),
         "INFO" => Ok(Command::Info),
