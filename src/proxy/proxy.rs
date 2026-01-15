@@ -3,7 +3,6 @@ use redis::aio::ConnectionManager;
 use redis::RedisResult;
 use redis_protocol::resp2::types::OwnedFrame as Resp2OwnedFrame;
 use redis_protocol::resp3::types::OwnedFrame as Resp3OwnedFrame;
-use std::mem;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -224,22 +223,62 @@ impl RedisProxy {
             }
         };
 
-        let conn_manager = {
-            let pool = self.connection_pool.read().await;
-            match pool.get_connection(&node.id) {
-                Some(conn) => conn,
-                None => return Ok("-ERR node connection not available\r\n".to_string()),
-            }
-        };
+        // Retry logic to handle connection failures and allow ConnectionManager to reconnect
+        const MAX_RETRIES: usize = 4;
+        const RETRY_DELAY_MS: u64 = 100;
 
-        let mut conn = conn_manager.lock().await;
-        match self.execute_redis_command(&mut conn, parts).await {
-            Ok(response) => Ok(response),
-            Err(e) => {
-                eprintln!("Error executing command on node {}: {}", node.id, e);
-                Ok(format!("-ERR {}\r\n", e))
+        let mut last_error = String::new();
+        for attempt in 0..MAX_RETRIES {
+            // If we've had failures, try recreating connections before getting new one
+            if attempt == 1 {
+                let mut pool = self.connection_pool.write().await;
+                if let Ok(_) = pool.recreate_all_connections(&node.id).await {
+                    drop(pool);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                } else {
+                    drop(pool);
+                }
+            }
+
+            let conn_manager = {
+                let pool = self.connection_pool.read().await;
+                match pool.get_connection(&node.id) {
+                    Some(conn) => conn,
+                    None => return Ok("-ERR node connection not available\r\n".to_string()),
+                }
+            };
+
+            let mut conn = conn_manager.lock().await;
+            // Test connection health with PING first
+            let ping_result: RedisResult<String> = redis::cmd("PING").query_async(&mut *conn).await;
+            match ping_result {
+                Ok(_) => {}
+                Err(e) => {
+                    last_error = format!("Connection health check failed: {}", e);
+                    drop(conn);
+                    if attempt < MAX_RETRIES - 1 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                            .await;
+                    }
+                    continue;
+                }
+            }
+
+            match self.execute_redis_command(&mut conn, parts).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    last_error = e.to_string();
+                    drop(conn);
+
+                    if attempt < MAX_RETRIES - 1 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                            .await;
+                    }
+                }
             }
         }
+
+        Ok(format!("-ERR {}\r\n", last_error))
     }
 
     async fn proxy_multi_key_command(&self, command: &str, keys: &[String]) -> Result<String> {
@@ -266,48 +305,107 @@ impl RedisProxy {
         // Execute command on each node and aggregate results
         let mut total_count = 0;
 
-        for (node_id, node_keys) in keys_by_node {
-            let conn_manager = {
-                let pool = self.connection_pool.read().await;
-                match pool.get_connection(&node_id) {
-                    Some(conn) => conn,
-                    None => return Ok("-ERR node connection not available\r\n".to_string()),
-                }
-            };
+        const MAX_RETRIES: usize = 4;
+        const RETRY_DELAY_MS: u64 = 100;
 
+        for (node_id, node_keys) in keys_by_node {
             let mut parts = vec![command.to_string()];
             parts.extend(node_keys);
 
-            let mut conn = conn_manager.lock().await;
-            match self.execute_redis_command(&mut conn, &parts).await {
-                Ok(response) => {
-                    // Parse the integer response
-                    if let Some(count_str) = response.strip_prefix(':') {
-                        if let Some(count_str) = count_str.strip_suffix("\r\n") {
-                            if let Ok(count) = count_str.parse::<i32>() {
-                                total_count += count;
+            // Retry logic for multi-key commands
+            let mut last_error = String::new();
+            let mut success = false;
+
+            for attempt in 0..MAX_RETRIES {
+                // Recreate connections early if we've had failures
+                if attempt == 1 {
+                    let mut pool = self.connection_pool.write().await;
+                    if let Ok(_) = pool.recreate_all_connections(&node_id).await {
+                        drop(pool);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    } else {
+                        drop(pool);
+                    }
+                }
+
+                let conn_manager = {
+                    let pool = self.connection_pool.read().await;
+                    match pool.get_connection(&node_id) {
+                        Some(conn) => conn,
+                        None => return Ok("-ERR node connection not available\r\n".to_string()),
+                    }
+                };
+
+                let mut conn = conn_manager.lock().await;
+
+                // Test connection health with PING first
+                let ping_result: RedisResult<String> =
+                    redis::cmd("PING").query_async(&mut *conn).await;
+                match ping_result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        last_error = format!("Connection health check failed: {}", e);
+                        drop(conn);
+                        if attempt < MAX_RETRIES - 1 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                                .await;
+                        }
+                        continue;
+                    }
+                }
+                match self.execute_redis_command(&mut conn, &parts).await {
+                    Ok(response) => {
+                        // Parse the integer response
+                        if let Some(count_str) = response.strip_prefix(':') {
+                            if let Some(count_str) = count_str.strip_suffix("\r\n") {
+                                if let Ok(count) = count_str.parse::<i32>() {
+                                    total_count += count;
+                                    success = true;
+                                    break;
+                                } else {
+                                    return Ok(format!(
+                                        "-ERR invalid response from node {}\r\n",
+                                        node_id
+                                    ));
+                                }
                             } else {
                                 return Ok(format!(
                                     "-ERR invalid response from node {}\r\n",
                                     node_id
                                 ));
                             }
+                        } else if response.starts_with("-ERR") {
+                            return Ok(response);
                         } else {
-                            return Ok(format!("-ERR invalid response from node {}\r\n", node_id));
+                            return Ok(format!(
+                                "-ERR unexpected response from node {}\r\n",
+                                node_id
+                            ));
                         }
-                    } else if response.starts_with("-ERR") {
-                        return Ok(response);
-                    } else {
-                        return Ok(format!(
-                            "-ERR unexpected response from node {}\r\n",
-                            node_id
-                        ));
+                    }
+                    Err(e) => {
+                        last_error = e.to_string();
+                        eprintln!(
+                            "Error executing command on node {} (attempt {}/{}): {}",
+                            node_id,
+                            attempt + 1,
+                            MAX_RETRIES,
+                            e
+                        );
+
+                        // Release the lock before sleeping
+                        drop(conn);
+
+                        if attempt < MAX_RETRIES - 1 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                                .await;
+                        }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error executing command on node {}: {}", node_id, e);
-                    return Ok(format!("-ERR {}\r\n", e));
-                }
+            }
+
+            if !success {
+                return Ok(format!("-ERR {}\r\n", last_error));
             }
         }
 
